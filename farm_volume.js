@@ -323,47 +323,52 @@ async function main() {
   let failures = 0;
   let fatal = null;
 
-  while (!stopping) {
-    const holdingRaw = await tokenBalanceRaw(connection, wallet.publicKey, cfg.tokenMint);
-    if (state.volume_usd >= cfg.target && holdingRaw <= 0n) break;
+  try {
+    while (!stopping) {
+      const holdingRaw = await tokenBalanceRaw(connection, wallet.publicKey, cfg.tokenMint);
+      if (state.volume_usd >= cfg.target && holdingRaw <= 0n) break;
 
-    await sleepUntil(nextAction);
-    if (stopping) break;
-    nextAction = Date.now() + cfg.interval * 1000;
+      await sleepUntil(nextAction);
+      if (stopping) break;
+      nextAction = Date.now() + cfg.interval * 1000;
 
-    try {
-      if (holdingRaw > 0n) {
-        await sellAll(cfg, connection, wallet, state);
-      } else if (state.volume_usd >= cfg.target) {
-        break;
-      } else {
-        const usdcBefore = await tokenBalanceRaw(connection, wallet.publicKey, USDC_MINT);
-        if (usdcBefore < cfg.buyRaw) {
-          const have = Number(usdcBefore) / 10 ** USDC_DECIMALS;
-          die(`need $${cfg.buyUsdc.toFixed(2)} USDC to buy, wallet has $${money(have)}`);
+      try {
+        if (holdingRaw > 0n) {
+          await sellAll(cfg, connection, wallet, state);
+        } else if (state.volume_usd >= cfg.target) {
+          break;
+        } else {
+          const usdcBefore = await tokenBalanceRaw(connection, wallet.publicKey, USDC_MINT);
+          if (usdcBefore < cfg.buyRaw) {
+            const have = Number(usdcBefore) / 10 ** USDC_DECIMALS;
+            die(`need $${cfg.buyUsdc.toFixed(2)} USDC to buy, wallet has $${money(have)}`);
+          }
+          const quote = await getQuote(cfg, USDC_MINT, cfg.tokenMint, cfg.buyRaw);
+          const signature = await sendSwap(cfg, connection, wallet, quote);
+          await waitForConfirmation(connection, signature);
+          let spent = await usdcDelta(connection, wallet.publicKey, usdcBefore, "spent");
+          if (spent <= 0) spent = Number(quote.inAmount) / 10 ** USDC_DECIMALS;
+          state.volume_usd += spent;
+          state.buys += 1;
+          saveState(state);
+          logTrade("BUY", `$${money(spent)} USDC -> token`, spent, state, cfg.target, signature);
         }
-        const quote = await getQuote(cfg, USDC_MINT, cfg.tokenMint, cfg.buyRaw);
-        const signature = await sendSwap(cfg, connection, wallet, quote);
-        await waitForConfirmation(connection, signature);
-        let spent = await usdcDelta(connection, wallet.publicKey, usdcBefore, "spent");
-        if (spent <= 0) spent = Number(quote.inAmount) / 10 ** USDC_DECIMALS;
-        state.volume_usd += spent;
-        state.buys += 1;
-        saveState(state);
-        logTrade("BUY", `$${money(spent)} USDC -> token`, spent, state, cfg.target, signature);
+        failures = 0;
+      } catch (error) {
+        failures += 1;
+        const side = holdingRaw > 0n ? "sell" : "buy";
+        const stamp = new Date().toTimeString().slice(0, 8);
+        console.log(`[${stamp}] ${side} failed (${failures}/${MAX_CONSECUTIVE_FAILURES}): ${error.message}`);
+        if (failures >= MAX_CONSECUTIVE_FAILURES) {
+          fatal = "too many failed swaps in a row. Stopping so fees do not keep burning.";
+          break;
+        }
+        nextAction = Date.now() + 2000;
       }
-      failures = 0;
-    } catch (error) {
-      failures += 1;
-      const side = holdingRaw > 0n ? "sell" : "buy";
-      const stamp = new Date().toTimeString().slice(0, 8);
-      console.log(`[${stamp}] ${side} failed (${failures}/${MAX_CONSECUTIVE_FAILURES}): ${error.message}`);
-      if (failures >= MAX_CONSECUTIVE_FAILURES) {
-        fatal = "too many failed swaps in a row. Stopping so fees do not keep burning.";
-        break;
-      }
-      nextAction = Date.now() + 2000;
     }
+  } catch (error) {
+    // Anything unexpected (e.g. an RPC read failing) still ends with a sell-to-USDC attempt.
+    fatal = `unexpected error: ${error.message}`;
   }
 
   if (stopping || fatal) {
