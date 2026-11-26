@@ -6,6 +6,8 @@
  *   t=10s  sell the entire token balance for USDC
  *   t=20s  buy again
  *   stops when tracked USDC notional reaches TARGET_VOLUME_USD
+ *   on stop (target, Ctrl+C, or repeated failures) any leftover token is sold, so the
+ *   wallet always ends in USDC
  *
  * Each confirmed buy adds the USDC spent. Each confirmed sell adds the USDC received.
  * Local volume is not Jupiter's leaderboard. The event indexer is the source of truth.
@@ -261,6 +263,33 @@ async function sellAll(cfg, connection, wallet, state) {
   throw lastError;
 }
 
+// Make sure the wallet ends in USDC, never in the farmed token.
+// Retries a few times so one bad quote does not leave a bag behind.
+async function liquidateToUsdc(cfg, connection, wallet, state) {
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    const balanceRaw = await tokenBalanceRaw(connection, wallet.publicKey, cfg.tokenMint);
+    if (balanceRaw <= 0n) {
+      console.log("wallet holds no token. Final balance is all USDC.");
+      return true;
+    }
+    console.log(`selling leftover token balance back to USDC (attempt ${attempt}/3)...`);
+    try {
+      await sellAll(cfg, connection, wallet, state);
+    } catch (error) {
+      const stamp = new Date().toTimeString().slice(0, 8);
+      console.log(`[${stamp}] final sell failed: ${error.message}`);
+      await sleep(2000);
+    }
+  }
+  const left = await tokenBalanceRaw(connection, wallet.publicKey, cfg.tokenMint);
+  if (left > 0n) {
+    console.log("WARNING: could not sell the full token balance. Wallet still holds the token. Run the script again to retry.");
+    return false;
+  }
+  console.log("wallet holds no token. Final balance is all USDC.");
+  return true;
+}
+
 async function main() {
   const cfg = loadConfig();
   const wallet = Keypair.fromSecretKey(loadSecret(cfg.privateKey));
@@ -292,6 +321,7 @@ async function main() {
 
   let nextAction = Date.now();
   let failures = 0;
+  let fatal = null;
 
   while (!stopping) {
     const holdingRaw = await tokenBalanceRaw(connection, wallet.publicKey, cfg.tokenMint);
@@ -329,18 +359,18 @@ async function main() {
       const stamp = new Date().toTimeString().slice(0, 8);
       console.log(`[${stamp}] ${side} failed (${failures}/${MAX_CONSECUTIVE_FAILURES}): ${error.message}`);
       if (failures >= MAX_CONSECUTIVE_FAILURES) {
-        die("too many failed swaps in a row. Stopping so fees do not keep burning.");
+        fatal = "too many failed swaps in a row. Stopping so fees do not keep burning.";
+        break;
       }
       nextAction = Date.now() + 2000;
     }
   }
 
-  if (stopping) {
-    console.log("stopped. Volume so far is saved in volume_state.json.");
-    const holdingNow = await tokenBalanceRaw(connection, wallet.publicKey, cfg.tokenMint);
-    if (holdingNow > 0n) {
-      console.log("wallet is still holding the token. Run the script again and it will sell first.");
-    }
+  if (stopping || fatal) {
+    console.log(stopping ? "stopped. Converting any leftover token back to USDC..." : `error: ${fatal}`);
+    await liquidateToUsdc(cfg, connection, wallet, state);
+    console.log("volume so far is saved in volume_state.json.");
+    if (fatal) process.exit(1);
     return;
   }
 
@@ -352,7 +382,7 @@ async function main() {
 process.on("SIGINT", () => {
   if (stopping) process.exit(1);
   stopping = true;
-  console.log("\nstopping after the current swap...");
+  console.log("\nstopping after the current swap, then selling any leftover token back to USDC...");
 });
 
 main().catch((error) => {
